@@ -6,18 +6,23 @@
 //! network, or if anything here fails, nothing is registered and the classical pipeline in
 //! `photocraft-algo` runs as before, so the tool always works.
 //!
+//! The model runs through Microsoft's ONNX Runtime (the `ort` crate, "download-binaries" and
+//! "copy-dylibs" features): the build downloads the matching `onnxruntime` shared library and
+//! copies it beside the compiled binary, so it must ship together with `photocraft.exe`.
+//!
 //! Environment: `PHOTOCRAFT_SUBJECT_MODEL=off` disables the download and the model;
 //! `PHOTOCRAFT_SUBJECT_MODEL_URL` (https only) and `PHOTOCRAFT_SUBJECT_MODEL_FILE` (a local
 //! `.onnx` path, no download) choose another U²-Net-compatible model (input 320x320).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use ndarray::Array4;
+use ort::{Environment, ExecutionProvider, GraphOptimizationLevel, Session, SessionBuilder, Value};
 use photocraft_algo::segment::RgbImage;
 use photocraft_algo::segment::subject::{SubjectMatter, set_matter};
-use tract_onnx::prelude::*;
 
 /// Network input side (U²-Net family).
 const SIZE: usize = 320;
@@ -28,10 +33,11 @@ const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-type Runner = Box<dyn Fn(Tensor) -> std::result::Result<Vec<f32>, String> + Send + Sync>;
-
 struct OnnxMatter {
-    run: Runner,
+    // Kept alongside the session only so the ONNX Runtime environment it was built from is never
+    // dropped first; the session does not borrow it directly.
+    _environment: Arc<Environment>,
+    session: Mutex<Session>,
 }
 
 impl SubjectMatter for OnnxMatter {
@@ -40,7 +46,8 @@ impl SubjectMatter for OnnxMatter {
             return None;
         }
         let input = preprocess(img)?;
-        let raw = (self.run)(input).ok()?;
+        let session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        let raw = infer(&session, input).ok()?;
         if raw.len() != SIZE * SIZE {
             return None;
         }
@@ -62,8 +69,8 @@ impl SubjectMatter for OnnxMatter {
 }
 
 /// `img` stretched to `SIZE` x `SIZE`, scaled by its maximum and normalised (rembg's recipe),
-/// as a 1x3xSIZExSIZE tensor.
-fn preprocess(img: &RgbImage) -> Option<Tensor> {
+/// as a 1x3xSIZExSIZE array.
+fn preprocess(img: &RgbImage) -> Option<Array4<f32>> {
     let mut chw = vec![0.0f32; 3 * SIZE * SIZE];
     let mut max = 1e-6f32;
     let mut resized = Vec::with_capacity(SIZE * SIZE);
@@ -81,7 +88,7 @@ fn preprocess(img: &RgbImage) -> Option<Tensor> {
             }
         }
     }
-    tract_ndarray::Array4::from_shape_vec((1, 3, SIZE, SIZE), chw).ok().map(Tensor::from)
+    Array4::from_shape_vec((1, 3, SIZE, SIZE), chw).ok()
 }
 
 /// Bilinear sample at normalised coordinates `u`, `v` (`0..=1`, pixel centres at half steps).
@@ -99,30 +106,33 @@ fn bilerp<const N: usize>(src: &[[f32; N]], w: usize, h: usize, u: f32, v: f32) 
     std::array::from_fn(|k| (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty)
 }
 
-fn load(path: &Path) -> std::result::Result<OnnxMatter, String> {
-    fn err<E: std::fmt::Display>(e: E) -> String {
-        e.to_string()
-    }
-    let model = tract_onnx::onnx()
-        .model_for_path(path)
-        .map_err(err)?
-        .with_input_fact(0, f32::fact([1usize, 3, SIZE, SIZE]).into())
-        .map_err(err)?
-        .into_optimized()
-        .map_err(err)?
-        .into_runnable()
-        .map_err(err)?;
-    let run: Runner = Box::new(move |input: Tensor| {
-        let outputs = model.run(tvec!(input.into())).map_err(|e| e.to_string())?;
-        // U²-Net's first output is the fused map; the rest are side outputs.
-        let first = outputs.first().ok_or_else(|| "the model returned no output".to_string())?;
-        let view = first.to_array_view::<f32>().map_err(|e| e.to_string())?;
-        Ok(view.iter().copied().collect())
-    });
-    Ok(OnnxMatter { run })
+/// Runs `session` on `input` and returns its first (fused) output, flattened.
+fn infer(session: &Session, input: Array4<f32>) -> Result<Vec<f32>, String> {
+    let array = input.into_dyn();
+    let value = Value::from_array(session.allocator(), &array).map_err(|e| e.to_string())?;
+    let outputs = session.run(vec![value]).map_err(|e| e.to_string())?;
+    let first = outputs.first().ok_or_else(|| "the model returned no output".to_string())?;
+    let tensor: ort::tensor::OrtOwnedTensor<f32, _> = first.try_extract().map_err(|e| e.to_string())?;
+    Ok(tensor.view().iter().copied().collect())
 }
 
-fn download(url: &str, dest: &Path) -> std::result::Result<(), String> {
+fn load(path: &Path) -> Result<OnnxMatter, String> {
+    let environment = Environment::builder()
+        .with_name("photocraft-subject")
+        .with_execution_providers([ExecutionProvider::CPU(Default::default())])
+        .build()
+        .map_err(|e| e.to_string())?
+        .into_arc();
+    let session = SessionBuilder::new(&environment)
+        .map_err(|e| e.to_string())?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| e.to_string())?
+        .with_model_from_file(path)
+        .map_err(|e| e.to_string())?;
+    Ok(OnnxMatter { _environment: environment, session: Mutex::new(session) })
+}
+
+fn download(url: &str, dest: &Path) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err("the model URL must be https".into());
     }
@@ -183,7 +193,8 @@ pub fn start(config_dir: Option<PathBuf>) {
             }
         }
         if !register(&path) {
-            // A damaged file would fail on every start: remove it so the next start downloads it again.
+            // A damaged file (or one the runtime can't load) would fail on every start: remove it
+            // so the next start downloads it again.
             let _ = std::fs::remove_file(&path);
         }
     });
@@ -212,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_http_model_is_an_error_not_a_panic() {
+    fn a_missing_model_or_a_non_https_url_is_an_error_not_a_panic() {
         assert!(load(Path::new("/nonexistent/model.onnx")).is_err());
         assert!(download("http://example.invalid/m.onnx", Path::new("/tmp/never")).is_err());
     }

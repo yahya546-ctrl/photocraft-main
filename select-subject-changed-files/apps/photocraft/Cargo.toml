@@ -40,8 +40,12 @@ chrono = { workspace = true }
 rfd = { workspace = true }
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 open = "5"
-# Learned Select Subject (src/subject_ml.rs): pure-Rust ONNX runtime and the one-time model download.
-tract-onnx = "0.21"
+# Learned Select Subject (src/subject_ml.rs): ONNX Runtime bindings (the "download-binaries" and
+# "copy-dylibs" features fetch the matching onnxruntime shared library at build time and copy it
+# next to the compiled exe - that file must ship alongside photocraft.exe) and the one-time model
+# download.
+ort = { version = "1.16.3", default-features = false, features = ["download-binaries", "copy-dylibs"] }
+ndarray = "0.15"
 ureq = "2"
 # Reads the saved window layout (eframe persistence) to drop values that would abort startup.
 ron = "0.12"

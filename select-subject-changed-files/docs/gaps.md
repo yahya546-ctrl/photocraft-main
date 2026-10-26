@@ -182,6 +182,7 @@ what an agent can't finish alone.
   a Neural Filters taskspace; users ask for local models (#2313, #1996, #2682).
 - **Progress (2026-10-17):** classical Object Finder no longer rejects a foreground solely for covering over 60% of the canvas (#6548); canvas-boundary coverage distinguishes it from the surrounding backdrop. This does not add semantic recognition or close #2788.
 - **Progress (2026-10-24):** Select Subject can use a small local ONNX model (U²-Netp, downloaded once when online, `apps/photocraft/src/subject_ml.rs`); offline or on failure the classical method runs (with a mild centre prior). Not yet measured on a corpus; needs owner decision #41 on the model licence/download.
+- **Update (2026-10-26):** switched the ONNX runtime from `tract-onnx` (pure Rust) to the `ort` crate (Microsoft's ONNX Runtime bindings) after `tract-onnx` failed to load U²-Netp's `Resize` op. `ort`'s "download-binaries"/"copy-dylibs" features fetch and place the `onnxruntime` shared library next to the built exe at compile time, so **that shared library must ship alongside `photocraft.exe`** (the CI workflow now uploads it too).
 - **Estimate:** 300–600 h. **Human:** owner decision #41 (model licences, local vs remote).
 
 ### G16. Plug-in compatibility
