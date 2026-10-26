@@ -1,0 +1,23 @@
+   name: Build Windows exe
+
+   on:
+     workflow_dispatch:
+
+   jobs:
+     build:
+       runs-on: windows-latest
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: Install Rust
+           uses: dtolnay/rust-toolchain@stable
+
+         - name: Build PhotoCraft (release)
+           run: cargo build -p photocraft --release
+
+         - name: Upload exe
+           uses: actions/upload-artifact@v4
+           with:
+             name: photocraft-windows
+             path: target/release/photocraft.exe
+             if-no-files-found: error
